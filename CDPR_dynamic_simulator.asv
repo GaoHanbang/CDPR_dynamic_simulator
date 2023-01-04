@@ -1,0 +1,367 @@
+%% This script is the simulator of CDPR system, and is tested with a simple PD controller
+
+clc
+clear
+close all
+
+%% Load data of CDPR system
+load('CRAFT_configuration.mat', 'configuration');
+A= configuration.A;
+B= configuration.B;
+frame_node = configuration.frame_nodes;
+mp_node = configuration.mp_nodes;
+
+%% Parameter Initialization
+payload_mass = 10 ; %kg
+g = 9.81; % N/kg
+pose_ini = [1.5,2.0,1.5,0,0,0]'; % Initial pose of end-effector
+tau_max = 100; % maximum tension
+tau_min = 1; % minimum tension to avoid the deform of the cable 
+We = [0,0,0,0,0,0]';
+Wg = [0,0,-payload_mass * g,0,0,0]';
+Inertia = diag([0.01,0.01,0.01]);
+%% Simulator options 
+
+t_max = 10;
+f_simu = 100; % frequency of the simulator 
+f_control = 50; % frequency of the controller
+dt = 1/f_simu;
+time_step_pos = 1/f_control;
+time_current = 0;
+
+%% Initial position plot
+
+%to make the 
+B_ini = B + pose_ini(1:3)* ones(1,8);
+mp_node_ini = mp_node + pose_ini(1:3)* ones(1,8);
+
+figure(1)
+plot3(frame_node(1,:),frame_node(2,:),frame_node(3,:),'ok');
+hold on
+plot3(A(1,:),A(2,:),A(3,:),'or')
+hold on
+plot3(B_ini(1,:),B_ini(2,:),B_ini(3,:),'ob')
+
+% eight vertice of the frame cube
+verts = frame_node';
+
+% faces connected by nodes
+faces=[1 7 4 6;
+       2 5 3 8;
+       2 4 6 8;
+       1 3 5 7;
+       1 3 8 6;
+       2 5 7 4];
+
+% plot the cube
+patch('Faces',faces,'Vertices',verts,'Facecolor','none','EdgeColor','k','LineWidth',2)
+axis equal
+axis([-0.5 4 -0.5 5 0 3])
+
+hold
+
+
+% eight vertice of the frame cube
+verts = mp_node_ini';
+
+% faces connected by nodes
+faces=[1 7 4 6;
+       2 5 3 8;
+       2 4 6 8;
+       1 3 5 7;
+       1 3 8 6;
+       2 5 7 4];
+
+% plot the cube
+patch('Faces',faces,'Vertices',verts,'Facecolor','none','EdgeColor','k')
+
+hold on
+
+% connect the exit points to correspond anchor points
+X = [A(1,:); B_ini(1,:)];
+Y = [A(2,:); B_ini(2,:)];
+Z = [A(3,:); B_ini(3,:)];
+plot3(X,Y,Z,'r','LineWidth',1.5);
+
+title('Initial configuration of CDPR system')
+xlabel('axis_x (m)') ; ylabel('axis_y (m)') ; zlabel('axis_x (m)') ;
+
+%% Define a desired trajectory in cartesian space
+% the desired trajectory will be a smooth curve (jerk minimum)
+all_times = linspace(time_current, t_max, t_max* f_control);
+
+freq = pi;
+ampl = 0.5;
+z_max = 0.5;
+xd_generated_x = ampl * sin( freq * all_times ) + pose_ini(1)*ones(1,t_max* f_control) ;
+xd_generated_y = ampl * cos( freq * all_times ) + pose_ini(2)*ones(1,t_max* f_control);
+% xd_generated_z = zeros(1, t_max/time_step_pos);
+xd_generated_z = all_times * z_max / t_max + pose_ini(3)*ones(1,t_max* f_control);
+xd_generated = [xd_generated_x', xd_generated_y', xd_generated_z'];
+
+vd_generated_x = freq *ampl * cos( freq * all_times );
+vd_generated_y = -freq *ampl * sin( freq * all_times );
+vd_generated_z = z_max/ t_max* ones(1,t_max/time_step_pos);
+vd_generated = [vd_generated_x', vd_generated_y', vd_generated_z'];
+% vd_generated = zeros(t_max/time_step_pos,3);
+thetad_generated = zeros(t_max/time_step_pos,3);
+omegad_generated = zeros(t_max/time_step_pos,3);
+% plot the generated trajectory in CDPR system
+plot3(xd_generated_x', xd_generated_y', xd_generated_z','LineWidth',1)
+
+%% Controller Options
+kp  = diag([100,100,100,20,20,20]); % Proportional controller
+kv  = diag([50,50,50,10,10,10]); % derivative controller
+
+
+%% Zip the data
+
+% data will be upzip in odefun
+data.A = A;
+data.B = B;
+data.Wg = Wg;
+data.We = We;
+data.m = payload_mass;
+data.inertia = Inertia;
+%% Plotting Initialization
+
+times = zeros(t_max/dt, 1);
+pos = zeros(t_max/dt, 3);
+vel = zeros(t_max/dt, 3);
+theta = zeros(t_max/dt, 3);
+omega = zeros(t_max/dt, 3);
+tau_mg = zeros(t_max/dt, 8);
+tau_c = zeros(t_max/dt, 8);
+tau_ff = zeros(t_max/dt, 8);
+
+%% Plant Simulation
+
+index = 1; %
+internal_index = 1;
+time_prev = time_current;
+odeopts = odeset('RelTol',1e-5,'AbsTol',1e-5);
+pos_0 = xd_generated(internal_index, :)';
+vel_0 = vd_generated(internal_index, :)';
+theta_0 = thetad_generated(internal_index, :)';
+omega_0 = omegad_generated(internal_index, :)';
+
+t_computing = cputime;
+while (time_current < t_max)
+    
+    if (t_max - time_current < dt*1e-2)
+        break;
+    end
+    fprintf('Simulation process: %f \n',time_current)
+    if (index==1 || ( (time_current-time_prev) >= time_step_pos-0.00000001 ) ) % runs at f_position
+        xLd = xd_generated(internal_index, :)';
+        thetaLd = thetad_generated(internal_index, :)';
+        vLd = vd_generated(internal_index, :)';
+        omegaLd = omegad_generated(internal_index, :)';
+        
+        % Calculate desired wrinch matrix
+        B_p = B + xLd* ones(1,8);
+        % x1,2,3 roll, pitch and roll
+        x1 = thetaLd(1);
+        x2 = thetaLd(2);
+        x3 = thetaLd(3);
+        
+        b_R_p = [cos(x3)*cos(x2),-sin(x3)*cos(x1)+cos(x3)*sin(x2)*sin(x1),sin(x3)*sin(x1)+cos(x3)*sin(x2)*cos(x1);
+        cos(x2)*sin(x3),cos(x1)*cos(x3)+sin(x1)*sin(x2)*sin(x3),-cos(x3)*sin(x1)+cos(x1)*sin(x2)*sin(x3);-sin(x2),cos(x2)*sin(x1),cos(x1)*cos(x2)];
+        l = A - B_p - b_R_p * B;
+        l_length = [norm(l(:,1)),norm(l(:,2)),norm(l(:,3)),norm(l(:,4)),norm(l(:,5)),norm(l(:,6)),norm(l(:,7)),norm(l(:,8))];
+        u = l./l_length;
+
+        M1 = cross(b_R_p*B(:,1),u(:,1));
+        M2 = cross(b_R_p*B(:,2),u(:,2));
+        M3 = cross(b_R_p*B(:,3),u(:,3));
+        M4 = cross(b_R_p*B(:,4),u(:,4));
+        M5 = cross(b_R_p*B(:,5),u(:,5));
+        M6 = cross(b_R_p*B(:,6),u(:,6));
+        M7 = cross(b_R_p*B(:,7),u(:,7));
+        M8 = cross(b_R_p*B(:,8),u(:,8));
+        M =[M1 M2 M3 M4 M5 M6 M7 M8];
+        Wd = [u;M];
+
+        % tension distribution
+        Nd = null(Wd);
+        x0d = Wd\(-Wg-We);
+        lb = tau_min*ones(8,1) - x0d;
+        ub = tau_max*ones(8,1) - x0d;
+        fun = @(x) norm(x0d+ Nd*[x(1);x(2)]);
+        cond_A = [Nd;-Nd];
+        cond_b = [ub;-lb];
+        lamda = fmincon(fun,-20*ones(2,1),cond_A,cond_b);
+        Tau_ff = x0d+ Nd*lamda;
+        
+        % calculate the PD controller torque
+        eq = [xLd - pos_0; thetaLd - theta_0];
+        deq = [vLd - vel_0; omegaLd - omega_0];
+        
+        Ip = b_R_p* Inertia *b_R_p';
+        IIp = blkdiag(payload_mass*eye(3),Ip);
+        Tau_c = Wd\(IIp* (kv* deq + kp* eq)); 
+%         Tau_c = Wd\(payload_mass* (kv* deq + kp* eq)); 
+        Tau_mg = Tau_ff+ Tau_c;
+%         Tau_mg = Tau_ff;
+        % Cable tension should remain tau_min ~ tau_max
+        Tau_mg = min(tau_max, max(tau_min, Tau_mg));
+        
+        time_prev = time_current;
+        internal_index = internal_index + 1;
+    end
+    % Calculate actual wrinch matrix
+    B_p = B + pos_0* ones(1,8);
+    % x1,2,3 roll, pitch and roll
+    x1 = theta_0(1);
+    x2 = theta_0(2);
+    x3 = theta_0(3);
+    
+    b_R_p = [cos(x3)*cos(x2),-sin(x3)*cos(x1)+cos(x3)*sin(x2)*sin(x1),sin(x3)*sin(x1)+cos(x3)*sin(x2)*cos(x1);
+        cos(x2)*sin(x3),cos(x1)*cos(x3)+sin(x1)*sin(x2)*sin(x3),-cos(x3)*sin(x1)+cos(x1)*sin(x2)*sin(x3);
+        -sin(x2),cos(x2)*sin(x1),cos(x1)*cos(x2)];
+    l = A - B_p - b_R_p * B;
+    l_length = [norm(l(:,1)),norm(l(:,2)),norm(l(:,3)),norm(l(:,4)),norm(l(:,5)),norm(l(:,6)),norm(l(:,7)),norm(l(:,8))];
+    u = l./l_length;
+    
+    M1 = cross(b_R_p*B(:,1),u(:,1));
+    M2 = cross(b_R_p*B(:,2),u(:,2));
+    M3 = cross(b_R_p*B(:,3),u(:,3));
+    M4 = cross(b_R_p*B(:,4),u(:,4));
+    M5 = cross(b_R_p*B(:,5),u(:,5));
+    M6 = cross(b_R_p*B(:,6),u(:,6));
+    M7 = cross(b_R_p*B(:,7),u(:,7));
+    M8 = cross(b_R_p*B(:,8),u(:,8));
+    M =[M1 M2 M3 M4 M5 M6 M7 M8];
+    W = [u;M];
+    data.W =  W;
+    data.tau_mg = Tau_mg;
+    x_0 = [pos_0; theta_0; vel_0; omega_0];
+    [~, x_var] = ode45(@odefun, [time_current time_current+dt], x_0, odeopts, data); 
+    %% Store and update variables
+    
+    times(index,1) = time_current;
+    pos(index,:)   = x_var(max(size(x_var)),1:3)';
+    theta(index,:) = x_var(max(size(x_var)),4:6)';
+    vel(index,:)   = x_var(max(size(x_var)),7:9)';
+    omega(index,:) = x_var(max(size(x_var)),10:12)';
+    tau_mg(index,:) = Tau_mg;
+    tau_ff(index,:) = Tau_ff;
+    tau_c(index,:) = Tau_c;
+    %update data
+    pos_0 = x_var(max(size(x_var)),1:3)';
+    theta_0 = x_var(max(size(x_var)),4:6)';
+    vel_0 = x_var(max(size(x_var)),7:9)';
+    omega_0 = x_var(max(size(x_var)),10:12)';
+    %update time
+    time_current = time_current + dt;
+    index = index + 1;
+end
+
+
+fprintf('Time to run the simulation is %f\n', cputime - t_computing);
+%% Plot
+
+figure(2)
+plot(times,pos);
+hold on 
+plot(all_times,xd_generated);
+title('Desired and simulated position w.r.t. time');
+grid on ; xlabel('time (s)') ; ylabel('position (m)') ;
+legend('x','y','z','xd','yd','zd');
+
+figure(3)
+plot(times,vel);
+hold on 
+plot(all_times,vd_generated);
+title('Desired and simulated velocity w.r.t. time');
+grid on ; xlabel('time (s)') ; ylabel('velocity (m/s)') ;
+legend('v_x','v_y','v_z','v_{xd}','v_{yd}','v_{zd}');
+
+figure(4)
+yyaxis left
+plot(all_times,pos( (1:max(size(all_times)))* round(f_simu/f_control),:)- xd_generated);
+yyaxis right
+plot(all_times,vel( (1:max(size(all_times)))* round(f_simu/f_control),:)- vd_generated);
+legend('e_x','e_y','e_z','e_{vx}','e_{vy}','e_{vz}');title('Error of generated and simulated results');
+grid on ; xlabel('Time (s)') ;
+yyaxis left; ylabel('error of position (m)');
+yyaxis right; ylabel('error of velocity (m/s)');
+
+%% Plot trajectory
+figure(5)
+plot3(xd_generated_x', xd_generated_y', xd_generated_z','LineWidth',1)
+hold on
+plot3(pos(:,1),pos(:,2),pos(:,3),'LineWidth',1)
+axis equal
+title('Desired and simulated trajectories');
+grid on ; xlabel('axis_x (s)') ; ylabel('axis_x (m)') ; zlabel('axis_z (m)') ;
+legend('x','y','z','xd','yd','zd');
+%% cable tension
+figure(6)
+plot(times,tau_c(:,:))
+title('Cable tension w.r.t. times');
+grid on ; xlabel('time (s)') ; ylabel('Force (N)') ;
+
+%% cable tension
+figure(7)
+plot(times,tau_ff(:,:))
+title('Cable tension w.r.t. times');
+grid on ; xlabel('time (s)') ; ylabel('Force (N)') ;
+%% Ode45 function 
+function dx = odefun(t,x,data)
+
+    %% extract data
+    A = data.A;
+    B = data.B;
+    We = data.We;
+    Wg = data.Wg;  
+    Inertia = data.inertia;
+    Tau_mg = data.tau_mg;
+    m = data.m;
+    W = data.W;
+    xL = x(1:3);
+    thetaL = x(4:6);
+    vL = x(7:9);
+    omegaL = x(10:12);
+
+    
+    %% Calculate W, not necessary but time consuming
+    
+    B_p = B + xL* ones(1,8);
+    % x1,2,3 roll, pitch and roll
+    x1 = thetaL(1);
+    x2 = thetaL(2);
+    x3 = thetaL(3);
+    
+    b_R_p = [cos(x3)*cos(x2),-sin(x3)*cos(x1)+cos(x3)*sin(x2)*sin(x1),sin(x3)*sin(x1)+cos(x3)*sin(x2)*cos(x1);
+        cos(x2)*sin(x3),cos(x1)*cos(x3)+sin(x1)*sin(x2)*sin(x3),-cos(x3)*sin(x1)+cos(x1)*sin(x2)*sin(x3);
+        -sin(x2),cos(x2)*sin(x1),cos(x1)*cos(x2)];
+%     l = A - B_p - b_R_p * B;
+%     l_length = [norm(l(:,1)),norm(l(:,2)),norm(l(:,3)),norm(l(:,4)),norm(l(:,5)),norm(l(:,6)),norm(l(:,7)),norm(l(:,8))];
+%     u = l./l_length;
+%     M1 = cross(b_R_p*B(:,1),u(:,1));
+%     M2 = cross(b_R_p*B(:,2),u(:,2));
+%     M3 = cross(b_R_p*B(:,3),u(:,3));
+%     M4 = cross(b_R_p*B(:,4),u(:,4));
+%     M5 = cross(b_R_p*B(:,5),u(:,5));
+%     M6 = cross(b_R_p*B(:,6),u(:,6));
+%     M7 = cross(b_R_p*B(:,7),u(:,7));
+%     M8 = cross(b_R_p*B(:,8),u(:,8));
+%     M =[M1 M2 M3 M4 M5 M6 M7 M8];
+%     W = [u;M];
+    %% Dynamics
+    
+    Ip = b_R_p* Inertia *b_R_p';
+    IIp = blkdiag(m*eye(3),Ip);
+    Cdp = [0;0;0; cross(omegaL, Ip* omegaL)];
+    ddp = IIp\(W*Tau_mg - Cdp + We + Wg);
+    % http://www.kwon3d.com/theory/euler/avel.html (wrong)  derivatives of the
+    % orientation angles to angular velocity: shorturl.at/mrGKO
+    theta_R_wp = [             cos(x3)/cos(x2),              sin(x3)/cos(x2), 0;
+                                        -sin(x3),                         cos(x3), 0;
+                cos(x3)*tan(x2), sin(x3)*tan(x2), 1];
+    omega = theta_R_wp * omegaL;
+%     omega = [0 0 0]';
+    dp = [vL; omega];
+    dx = [dp; ddp] ;
+end
